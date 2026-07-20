@@ -1,0 +1,50 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum Role {
+  INVESTOR
+  CREATOR
+  ADMIN
+}
+
+model User {
+  id            String   @id @default(uuid())
+  email         String   @unique
+  passwordHash  String
+  role          Role     @default(INVESTOR)
+  walletBalance Float    @default(1000.0)
+  createdAt     DateTime @default(now())
+
+  creatorProfile Creator?
+  holdings       Holding[]
+}
+
+model Creator {
+  id               String   @id @default(uuid())
+  userId           String   @unique
+  user             User     @relation(fields: [userId], references: [id])
+  channelName      String
+  youtubeChannelId String   @unique
+  totalShares      Int      @default(0)
+  floatShares      Int      @default(0)
+  ipoPrice         Float?
+  createdAt        DateTime @default(now())
+
+  holdings Holding[]
+}
+
+model Holding {
+  id          String  @id @default(uuid())
+  userId      String
+  user        User    @relation(fields: [userId], references: [id])
+  creatorId   String
+  creator     Creator @relation(fields: [creatorId], references: [id])
+  quantity    Int
+  avgBuyPrice Float
+}
