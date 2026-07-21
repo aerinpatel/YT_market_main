@@ -5,12 +5,17 @@ generator client {
 datasource db {
   provider = "postgresql"
   url      = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
 }
 
+// ─────────────────────────────────────────────
+// Users & roles
+// ─────────────────────────────────────────────
+
 enum Role {
-  INVESTOR
-  CREATOR
   ADMIN
+  CREATOR
+  INVESTOR
 }
 
 model User {
@@ -18,33 +23,184 @@ model User {
   email         String   @unique
   passwordHash  String
   role          Role     @default(INVESTOR)
-  walletBalance Float    @default(1000.0)
+  walletBalance Decimal  @default(1000) @db.Decimal(14, 2)
   createdAt     DateTime @default(now())
 
+  // A user with role CREATOR has exactly one Creator profile
   creatorProfile Creator?
-  holdings       Holding[]
+
+  holdings     Holding[]
+  ordersPlaced Order[]
+  realizedPnls RealizedPnL[]
+  adminActions AdminAction[] @relation("AdminActor")
+}
+
+// ─────────────────────────────────────────────
+// Creators (the tradable "companies")
+// ─────────────────────────────────────────────
+
+enum IpoStatus {
+  PENDING
+  LISTED
+  DELISTED
 }
 
 model Creator {
-  id               String   @id @default(uuid())
-  userId           String   @unique
-  user             User     @relation(fields: [userId], references: [id])
+  id               String    @id @default(uuid())
+  userId           String    @unique
+  user             User      @relation(fields: [userId], references: [id])
   channelName      String
-  youtubeChannelId String   @unique
-  totalShares      Int      @default(0)
-  floatShares      Int      @default(0)
-  ipoPrice         Float?
-  createdAt        DateTime @default(now())
+  youtubeChannelId String    @unique
+  totalShares      BigInt    @default(0)
+  floatShares      BigInt    @default(0) // shares offered to the public at IPO
+  ownerShares      BigInt    @default(0) // shares retained by the creator
+  ipoStatus        IpoStatus @default(PENDING)
+  ipoPrice         Decimal?  @db.Decimal(10, 2)
+  listedAt         DateTime?
+  createdAt        DateTime  @default(now())
 
-  holdings Holding[]
+  scores        CreatorScore[]
+  orders        Order[]
+  trades        Trade[]
+  holdings      Holding[]
+  realizedPnls  RealizedPnL[]
+
+  @@index([ipoStatus])
 }
 
+// Fundamental score snapshots pulled from the YouTube API.
+// Deliberately has NO foreign key into Order or Trade — the score
+// engine only ever produces facts, never writes price directly.
+model CreatorScore {
+  id                String   @id @default(uuid())
+  creatorId         String
+  creator           Creator  @relation(fields: [creatorId], references: [id])
+  subscribers       BigInt
+  totalViews        BigInt
+  totalLikes        BigInt
+  totalComments     BigInt
+  videoCount        Int
+  uploadConsistency Float // 0.0–1.0, based on upload gap variance
+  computedScore     Float // single blended fundamental score
+  recordedAt        DateTime @default(now())
+
+  @@index([creatorId, recordedAt])
+}
+
+// ─────────────────────────────────────────────
+// Holdings
+// ─────────────────────────────────────────────
+
 model Holding {
-  id          String  @id @default(uuid())
-  userId      String
-  user        User    @relation(fields: [userId], references: [id])
+  id              String  @id @default(uuid())
+  userId          String
+  user            User    @relation(fields: [userId], references: [id])
+  creatorId       String
+  creator         Creator @relation(fields: [creatorId], references: [id])
+  quantity        BigInt
+  avgBuyPrice     Decimal @db.Decimal(10, 2) // weighted average cost — used for P&L
+  lowestBuyPrice  Decimal @db.Decimal(10, 2) // shown separately, NOT used for P&L
+  highestBuyPrice Decimal @db.Decimal(10, 2) // shown separately, NOT used for P&L
+
+  realizedPnls RealizedPnL[]
+
+  @@unique([userId, creatorId])
+}
+
+// ─────────────────────────────────────────────
+// Orders & trades (the matching engine's persistence layer)
+// ─────────────────────────────────────────────
+
+enum OrderSide {
+  BUY
+  SELL
+}
+
+enum OrderType {
+  LIMIT
+  MARKET
+}
+
+enum OrderStatus {
+  OPEN
+  PARTIAL
+  FILLED
+  CANCELLED
+}
+
+model Order {
+  id                String      @id @default(uuid())
+  userId            String
+  user              User        @relation(fields: [userId], references: [id])
+  creatorId         String
+  creator           Creator     @relation(fields: [creatorId], references: [id])
+  side              OrderSide
+  type              OrderType
+  price             Decimal?    @db.Decimal(10, 2) // null for market orders
+  quantity          BigInt
+  remainingQuantity BigInt
+  status            OrderStatus @default(OPEN)
+  isCreatorAction   Boolean     @default(false) // buyback / liquidation flag
+  createdAt         DateTime    @default(now())
+  updatedAt         DateTime    @updatedAt
+
+  buyTrades  Trade[] @relation("BuyOrder")
+  sellTrades Trade[] @relation("SellOrder")
+
+  // Supports fast "best price" lookups per creator/side/status
+  @@index([creatorId, side, status, price])
+  @@index([userId])
+}
+
+model Trade {
+  id          String   @id @default(uuid())
   creatorId   String
-  creator     Creator @relation(fields: [creatorId], references: [id])
-  quantity    Int
-  avgBuyPrice Float
+  creator     Creator  @relation(fields: [creatorId], references: [id])
+  buyOrderId  String
+  buyOrder    Order    @relation("BuyOrder", fields: [buyOrderId], references: [id])
+  sellOrderId String
+  sellOrder   Order    @relation("SellOrder", fields: [sellOrderId], references: [id])
+  price       Decimal  @db.Decimal(10, 2)
+  quantity    BigInt
+  executedAt  DateTime @default(now())
+
+  realizedPnl RealizedPnL?
+
+  @@index([creatorId, executedAt])
+}
+
+// Written only when a sell closes out (part of) a position.
+// Immutable, historical fact — never recalculated after the fact,
+// even if avg-cost logic changes later.
+model RealizedPnL {
+  id            String   @id @default(uuid())
+  userId        String
+  user          User     @relation(fields: [userId], references: [id])
+  creatorId     String
+  creator       Creator  @relation(fields: [creatorId], references: [id])
+  holdingId     String
+  holding       Holding  @relation(fields: [holdingId], references: [id])
+  tradeId       String   @unique
+  trade         Trade    @relation(fields: [tradeId], references: [id])
+  avgCostAtSale Decimal  @db.Decimal(10, 2)
+  sellPrice     Decimal  @db.Decimal(10, 2)
+  quantity      BigInt
+  pnl           Decimal  @db.Decimal(14, 2)
+  realizedAt    DateTime @default(now())
+
+  @@index([userId, creatorId])
+}
+
+// ─────────────────────────────────────────────
+// Audit log for admin actions
+// ─────────────────────────────────────────────
+
+model AdminAction {
+  id           String   @id @default(uuid())
+  adminId      String
+  admin        User     @relation("AdminActor", fields: [adminId], references: [id])
+  actionType   String
+  targetUserId String?
+  details      Json?
+  createdAt    DateTime @default(now())
 }
